@@ -5,7 +5,6 @@ package bon
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -28,7 +27,7 @@ type Transporter interface {
 	//
 	// If you don't have multiple server environment that each server handles different
 	// kind of routes you can safely ignore exploring the Route argument.
-	Open(Route) (net.Conn, error)
+	Open() (net.Conn, error)
 
 	// Accept will accept connections whenever any available.
 	Accept() (net.Conn, error)
@@ -44,10 +43,7 @@ type Bon struct {
 
 	handlers map[Route]func(net.Conn)
 	hm       sync.RWMutex
-
-	nonMatchingHandler func(net.Conn)
-	nhm                sync.RWMutex
-
+	
 	// options keeps user options for Bon
 	options *opts
 
@@ -96,13 +92,6 @@ func (b *Bon) Handle(r Route, h func(net.Conn)) {
 	b.handlers[r] = h
 }
 
-// HandleNonMatching will handle connections that doesn't match any route. If you don't register
-// a handler here, the sender will have a HandlerError.
-func (b *Bon) HandleNonMatching(h func(net.Conn)) {
-	b.nhm.Lock()
-	defer b.nhm.Unlock()
-	b.nonMatchingHandler = h
-}
 
 // Off will remove the registered handler for r.
 func (b *Bon) Off(r Route) {
@@ -111,23 +100,13 @@ func (b *Bon) Off(r Route) {
 	delete(b.handlers, r)
 }
 
-// OffNonMatching will remove non-matching handler.
-func (b *Bon) OffNonMatching() {
-	b.nhm.Lock()
-	defer b.nhm.Unlock()
-	b.nonMatchingHandler = nil
-}
 
-const (
-	handlerExists uint32 = 1 << iota
-	nonMatchingHandlerExists
-	handlerDoesNotExists
-)
+
 
 // Connect opens a new connection for given route. If there is no handler for r at the
 // receiver's end an error will be returned.
 func (b *Bon) Connect(r Route) (net.Conn, error) {
-	conn, err := b.transporter.Open(r)
+	conn, err := b.transporter.Open()
 	if err != nil {
 		return nil, err
 	}
@@ -138,20 +117,7 @@ func (b *Bon) Connect(r Route) (net.Conn, error) {
 		return nil, err
 	}
 
-	// get an answer from receiver if we got a handler match
-	// if we do we can return the conn to user.
-	data, err := b.readUInt32(conn)
-	if err != nil {
-		return nil, err
-	}
-
-	switch data {
-	case handlerExists:
-		return conn, nil
-	case nonMatchingHandlerExists:
-		return conn, nil
-	}
-	return nil, HandlerError{r}
+	return conn, nil
 }
 
 // Run accepts incoming connections. It blocks till a network failure then
@@ -183,30 +149,10 @@ func (b *Bon) handleConn(conn net.Conn) {
 		return
 	}
 
-	handlerExistence := handlerDoesNotExists
 	b.hm.RLock()
 	h := b.handlers[Route(data)]
 	b.hm.RUnlock()
 
-	if h != nil {
-		handlerExistence = handlerExists
-	} else {
-		b.nhm.RLock()
-		h = b.nonMatchingHandler
-		b.nhm.RUnlock()
-
-		if h != nil {
-			handlerExistence = nonMatchingHandlerExists
-			h = b.nonMatchingHandler
-		}
-	}
-
-	// tell to the sender if we got a matching handler or not.
-	err = b.writeUInt32(conn, handlerExistence)
-	if err != nil {
-		b.log.Println(err)
-		return
-	}
 
 	if h != nil {
 		h(conn)
@@ -233,17 +179,4 @@ func (b *Bon) readUInt32(conn net.Conn) (data uint32, err error) {
 	}
 	s := binary.BigEndian.Uint32(buf)
 	return uint32(s), nil
-}
-
-// HandlerError implements error interface and produced as a return value of
-// Connect if there is no matching handler and HandleNonMatching is not set for
-// given Route at the receiver's end.
-type HandlerError struct {
-	// Route is the non-matching Route.
-	Route Route
-}
-
-// Error will return an error in string format.
-func (e HandlerError) Error() string {
-	return fmt.Sprintf("no `%d` handler does not exists.", e.Route)
 }
